@@ -5,195 +5,156 @@ import json
 import time
 from dotenv import load_dotenv
 
-# Import components
-from whisperx_component import process_audio
-from llm_component import generate_local_response
+# --- Import Refactored Components ---
+# Note the function name changes to match the files above
+from whisperx_component import load_whisperx_models, process_audio_live
+from llm_component import load_llm_pipeline, generate_response_live
+from speaker_recognition_component import load_speaker_encoder, recognize_speakers_live
+from recorder_threshold import VADRecorder
 from speechbrain_component import extract_and_save_speaker_data
 from speaker_training_component import train_speaker_model
-from speaker_recognition_component import recognize_speakers
-# Import the VAD Recorder
-from recorder_threshold import VADRecorder
 
-# --- Helper Functions for LLM Interaction ---
-
+# --- Helper Functions (Same as before) ---
 def format_transcript_for_llm(segments: list, pre_identified_map: dict = None) -> str:
-    """
-    Converts segments to text.
-    """
-    if pre_identified_map is None:
-        pre_identified_map = {}
-
+    if pre_identified_map is None: pre_identified_map = {}
     transcript_text = ""
     for segment in segments:
         raw_speaker = segment.get("speaker", "UNKNOWN")
-        # Use existing name if available, else raw ID
         display_name = pre_identified_map.get(raw_speaker, raw_speaker)
-        
         text = segment["text"].strip()
         transcript_text += f"[{display_name}]: {text}\n"
     return transcript_text
 
 def create_llm_prompt(transcript_text: str) -> str:
-    prompt = f"""
-    Given the following transcript,
-    I want you to give back speaker name labels if any of them are identified, otherwise label them as "Unknown_Speaker_N".
-    Return your result in JSON format in this format:
-    {{
-    "SPEAKER_00": "Label"
-    }}
-
+    return f"""
+    Given the transcript below, identify speaker names.
+    Return JSON format: {{"SPEAKER_00": "Name"}}
+    If unknown, ignore.
+    
     TRANSCRIPT:
-    ---
     {transcript_text}
-    ---
     """
-    return prompt
 
 def parse_speaker_map_from_llm(response_text: str) -> dict:
-    """Safely parses the LLM's text response to extract a JSON object."""
     try:
         json_start = response_text.find('{')
         json_end = response_text.rfind('}') + 1
-        
-        if json_start == -1 or json_end == 0:
-            return {}
-
-        json_string = response_text[json_start:json_end]
-        speaker_map = json.loads(json_string)
-        if isinstance(speaker_map, dict):
-            return speaker_map
-        return {}
-    except Exception:
+        if json_start == -1: return {}
+        return json.loads(response_text[json_start:json_end])
+    except:
         return {}
 
-# --- Pipeline Function ---
-
-def run_pipeline_on_file(audio_file_path: str, hf_token: str, device: str, compute_type: str):
-    """
-    Runs the full processing pipeline on a single audio file.
-    """
-    print(f"\n[Pipeline] Processing captured file: {audio_file_path}")
-
-    # --- Step 1: Transcription & Diarization ---
-    print("\n--- 1. TRANSCRIPTION & DIARIZATION ---")
-    final_segments = process_audio(audio_file_path, device, compute_type, hf_token)
-
-    if not final_segments:
-        print("[Pipeline] No speech segments found in recording.")
+# --- The Pipeline Function (Optimized) ---
+def run_live_pipeline(
+    audio_file_path: str, 
+    device: str,
+    # Pass in the loaded models
+    whisper_objects: dict,
+    llm_pipe: object,
+    speaker_encoder: object
+):
+    start_time = time.time()
+    
+    # 1. Transcription (Fast, using pre-loaded model)
+    segments = process_audio_live(audio_file_path, whisper_objects, device)
+    if not segments:
         return
 
-    # --- Step 2: LLM Contextual Identification (PRIORITY) ---
-    print("\n--- 2. LLM CONTEXTUAL IDENTIFICATION ---")
-    raw_transcript = format_transcript_for_llm(final_segments, pre_identified_map={})
+    # 2. LLM Identification
+    raw_transcript = format_transcript_for_llm(segments, {})
     llm_prompt = create_llm_prompt(raw_transcript)
-
-    print("[Pipeline] Sending transcript to LLM...")
-    llm_response = generate_local_response(llm_prompt, max_new_tokens=300)
+    llm_response = generate_response_live(llm_pipe, llm_prompt)
     llm_map = parse_speaker_map_from_llm(llm_response)
 
-    print(f"[Pipeline] LLM identified: {llm_map}")
-
-    # --- Step 3: Biometric Speaker Recognition ---
-    print("\n--- 3. BIOMETRIC SPEAKER RECOGNITION ---")
-    biometric_map = recognize_speakers(
+    # 3. Biometric Recognition (Fast, using pre-loaded encoder)
+    biometric_map = recognize_speakers_live(
         audio_path=audio_file_path,
-        segments=final_segments,
+        segments=segments,
+        classifier_model=speaker_encoder, # Pass model
         registry_path="speaker_registry.pt",
         threshold=0.35,
         device=device
     )
 
-    if biometric_map:
-        print(f"[Pipeline] Biometrics identified: {biometric_map}")
-    else:
-        print("[Pipeline] No known speakers recognized biometrically.")
+    # 4. Merge
+    final_map = biometric_map.copy()
+    final_map.update(llm_map)
 
-    # --- Step 4: Merge Results ---
-    final_speaker_map = biometric_map.copy()
-    final_speaker_map.update(llm_map) # LLM overrides biometrics if conflict
+    # 5. Output
+    print(f"\n--- Result ({time.time() - start_time:.2f}s processing) ---")
+    prev_spk = None
+    for seg in segments:
+        raw = seg.get("speaker", "UNKNOWN")
+        name = final_map.get(raw, raw)
+        if name != prev_spk:
+            print(f"\n[{name}]:", end=" ")
+            prev_spk = name
+        print(seg["text"].strip(), end=" ")
+    print("\n----------------------------------------------\n")
 
-    print(f"\n[Pipeline] Final merged speaker map: {final_speaker_map}")
-
-    # --- Step 5: Output Final Labeled Transcript ---
-    print("\n" + "="*40)
-    print(" LIVE TRANSCRIPT ")
-    print("="*40)
-    previous_speaker = None
-    for segment in final_segments:
-        raw_speaker = segment.get("speaker", "UNKNOWN")
-        display_name = final_speaker_map.get(raw_speaker, raw_speaker)
-        start = segment["start"]
-        text = segment["text"].strip()
-        
-        if display_name != previous_speaker:
-            print(f"\n[{start:.2f}s] {display_name}: ", end="")
-            previous_speaker = display_name
-        print(text, end=" ")
-    print("\n" + "="*40 + "\n")
-
-    # --- Step 6: Update Speaker Registry ---
-    print("--- 4. UPDATING SPEAKER REGISTRY ---")
-    known_segments = []
-    for segment in final_segments:
-        raw_spk = segment.get("speaker", "UNKNOWN")
-        name = final_speaker_map.get(raw_spk, raw_spk)
-        
-        is_unknown = (
-            "unknown" in name.lower() or 
-            name.startswith("SPEAKER_") or 
-            name == raw_spk 
-        )
-        
-        if not is_unknown:
-            known_segments.append(segment)
-
+    # 6. Update Registry (Optional/Background)
+    # We skip optimization here as this happens rarely
+    known_segments = [
+        s for s in segments 
+        if not ("unknown" in final_map.get(s.get("speaker"), "").lower() or 
+                final_map.get(s.get("speaker")).startswith("SPEAKER_"))
+    ]
+    
     if known_segments:
-        print(f"[Pipeline] Enrolling {len(known_segments)} segments...")
-        extract_and_save_speaker_data(audio_file_path, known_segments, final_speaker_map)
+        print("[System] Updating speaker registry...")
+        extract_and_save_speaker_data(audio_file_path, known_segments, final_map)
         train_speaker_model(data_dir="speaker_data", model_save_path="speaker_registry.pt", device=device)
-    else:
-        print("[Pipeline] No new identified speakers to enroll.")
 
-# --- Main Execution Loop ---
-
+# --- Main Startup ---
 if __name__ == "__main__":
-    # 1. Load Environment
-    load_dotenv() 
+    load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
-    if not hf_token:
-        raise EnvironmentError("HF_TOKEN environment variable not found.")
+    if not hf_token: raise EnvironmentError("HF_TOKEN missing.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Use float16 for CUDA to save VRAM
     compute_type = "float16" if device == "cuda" else "int8"
     
-    # 2. Initialize VAD Recorder
-    # Adjustable: amplitude_threshold=0.01 to 0.05 depends on mic sensitivity
-    recorder = VADRecorder(amplitude_threshold=0.02, min_record_duration_ms=1000)
-    
-    print(f"\n--- SYSTEM READY ({device.upper()}) ---")
-    print("Listening for speech... (Press Ctrl+C to stop)")
+    print("\n" + "="*50)
+    print(" SYSTEM STARTUP - LOADING MODELS ")
+    print(" (This may take 10-20 seconds) ")
+    print("="*50)
 
-    recording_filename = "auto.wav"
-
+    # --- LOAD EVERYTHING ONCE ---
     try:
-        while True:
-            # 3. Blocking call: waits for sound, records, waits for silence, returns filename
-            # This uses the logic from stt_threshold.py / recorder_threshold.py
-            output_file = recorder.record(recording_filename)
-            
-            if output_file:
-                # 4. Run the existing pipeline on the newly recorded file
-                try:
-                    run_pipeline_on_file(output_file, hf_token, device, compute_type)
-                except Exception as e:
-                    print(f"Error in pipeline processing: {e}")
-                
-                print("\n[System] Listening again...\n")
-                
-            else:
-                # If recorder returns None (e.g. glitch or too short), just loop
-                pass
+        # 1. WhisperX
+        whisper_objects = load_whisperx_models(device, compute_type, hf_token)
+        
+        # 2. LLM (Gemma)
+        llm_pipe = load_llm_pipeline(device)
+        
+        # 3. SpeechBrain Encoder
+        speaker_encoder = load_speaker_encoder(device)
+        
+        # 4. VAD Recorder
+        recorder = VADRecorder(amplitude_threshold=0.02)
+        
+    except Exception as e:
+        print(f"Startup Failure: {e}")
+        sys.exit(1)
 
-    except KeyboardInterrupt:
-        print("\n\nStopping system. Goodbye.")
-        sys.exit(0)
+    print("\n[System] All models loaded. Ready for live input.\n")
+
+    while True:
+        try:
+            # 1. Listen
+            audio_file = recorder.record("live_input.wav")
+            
+            if audio_file:
+                # 2. Process with loaded models
+                run_live_pipeline(
+                    audio_file, 
+                    device, 
+                    whisper_objects, 
+                    llm_pipe, 
+                    speaker_encoder
+                )
+                
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
