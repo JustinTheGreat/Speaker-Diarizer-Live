@@ -136,8 +136,11 @@ Open your web browser and navigate to:
 4.  **Merge:** The system merges the results. (LLM decisions take priority and trigger retraining).
 5.  **Broadcast:** Results are sent via WebSocket to the HTML frontend.
 
-## 📝 To- Do Improvements
+## 📝 To- Do Improvements ( Will work on down the line)
  - Improve Contextual Identification, sliding window over speakers behind in the past identifying them(re-identify, use lighter methods)
  - Improve the Hybrid model by making it adapt to speakers long term voice training (People using different contexts)
  - Create different timings for tutorial to use for different conversations aiming
  - Adaptive conversation timing stopping
+
+## *Note*
+- If you want to experiment with other LLM speaker context identification, feel free to modify the LLM component model and make sure to get access to those other models.
