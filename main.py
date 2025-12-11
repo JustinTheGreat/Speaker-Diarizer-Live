@@ -6,7 +6,6 @@ import time
 from dotenv import load_dotenv
 
 # --- Import Refactored Components ---
-# Note the function name changes to match the files above
 from whisperx_component import load_whisperx_models, process_audio_live
 from llm_component import load_llm_pipeline, generate_response_live
 from speaker_recognition_component import load_speaker_encoder, recognize_speakers_live
@@ -14,7 +13,6 @@ from recorder_threshold import VADRecorder
 from speechbrain_component import extract_and_save_speaker_data
 from speaker_training_component import train_speaker_model
 
-# --- Helper Functions (Same as before) ---
 def format_transcript_for_llm(segments: list, pre_identified_map: dict = None) -> str:
     if pre_identified_map is None: pre_identified_map = {}
     transcript_text = ""
@@ -44,18 +42,16 @@ def parse_speaker_map_from_llm(response_text: str) -> dict:
     except:
         return {}
 
-# --- The Pipeline Function (Optimized) ---
 def run_live_pipeline(
     audio_file_path: str, 
     device: str,
-    # Pass in the loaded models
     whisper_objects: dict,
     llm_pipe: object,
     speaker_encoder: object
 ):
     start_time = time.time()
     
-    # 1. Transcription (Fast, using pre-loaded model)
+    # 1. Transcription
     segments = process_audio_live(audio_file_path, whisper_objects, device)
     if not segments:
         return
@@ -66,66 +62,99 @@ def run_live_pipeline(
     llm_response = generate_response_live(llm_pipe, llm_prompt)
     llm_map = parse_speaker_map_from_llm(llm_response)
 
-    # 3. Biometric Recognition (Fast, using pre-loaded encoder)
-    biometric_map = recognize_speakers_live(
+    # 3. Biometric Recognition
+    # Returns complex object: {'SPEAKER_00': {'name': 'Bob', 'score': 0.45}}
+    biometric_results = recognize_speakers_live(
         audio_path=audio_file_path,
         segments=segments,
-        classifier_model=speaker_encoder, # Pass model
+        classifier_model=speaker_encoder, 
         registry_path="speaker_registry.pt",
         threshold=0.35,
         device=device
     )
 
-    # 4. Merge
-    final_map = biometric_map.copy()
-    final_map.update(llm_map)
+    # --- FIX: Flatten Biometric Results for Compatibility ---
+    # We extract just the name so 'final_map' contains strings, not dicts.
+    biometric_map = {}
+    for spk, data in biometric_results.items():
+        if isinstance(data, dict):
+            biometric_map[spk] = data["name"]
+        else:
+            biometric_map[spk] = data
+    # -------------------------------------------------------
 
-    # 5. Output
-    print(f"\n--- Result ({time.time() - start_time:.2f}s processing) ---")
+    # 4. Smart Merge (Prevent LLM from overwriting good data)
+    final_map = biometric_map.copy()
+    
+    for spk_id, name in llm_map.items():
+        # Check if the LLM returned a generic name
+        is_generic = any(x in name.lower() for x in ["unknown", "speaker", "person"])
+        
+        if not is_generic:
+            if spk_id in final_map and final_map[spk_id] != name:
+                print(f"  [Merge] LLM overriding Biometrics for {spk_id}: '{final_map[spk_id]}' -> '{name}'")
+            
+            final_map[spk_id] = name
+
+    # 5. ORPHAN HANDLING
+    detected_names = list(set(final_map.values()))
+    dominant_speaker = detected_names[0] if len(detected_names) == 1 else None
+
+    print(f"\n--- Result ({time.time() - start_time:.2f}s) ---")
+    
     prev_spk = None
     for seg in segments:
         raw = seg.get("speaker", "UNKNOWN")
-        name = final_map.get(raw, raw)
+        
+        # Resolve Name
+        if raw in final_map:
+            name = final_map[raw]
+        elif raw == "UNKNOWN" and dominant_speaker:
+            name = dominant_speaker
+        else:
+            name = raw
+
         if name != prev_spk:
             print(f"\n[{name}]:", end=" ")
             prev_spk = name
         print(seg["text"].strip(), end=" ")
     print("\n----------------------------------------------\n")
 
-    # 6. Update Registry (Optional/Background)
-    # We skip optimization here as this happens rarely
-    known_segments = [
-        s for s in segments 
-        if not ("unknown" in final_map.get(s.get("speaker"), "").lower() or 
-                final_map.get(s.get("speaker")).startswith("SPEAKER_"))
-    ]
+    # 6. Update Registry
+    known_segments = []
+    for s in segments:
+        raw = s.get("speaker")
+        if raw and raw in final_map:
+             known_segments.append(s)
     
     if known_segments:
-        print("[System] Updating speaker registry...")
         extract_and_save_speaker_data(audio_file_path, known_segments, final_map)
-        train_speaker_model(data_dir="speaker_data", model_save_path="speaker_registry.pt", device=device)
-
-# --- Main Startup ---
+        train_speaker_model(
+            data_dir="speaker_data", 
+            model_save_path="speaker_registry.pt", 
+            device=device,
+            classifier_model=speaker_encoder
+        )
+        
 if __name__ == "__main__":
     load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
-    if not hf_token: raise EnvironmentError("HF_TOKEN missing.")
+    if not hf_token: 
+        # Fallback to prevent immediate crash if not set, though models might fail later
+        print("Warning: HF_TOKEN not found in environment.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Use float16 for CUDA to save VRAM
     compute_type = "float16" if device == "cuda" else "int8"
     
     print("\n" + "="*50)
     print(" SYSTEM STARTUP - LOADING MODELS ")
-    print(" (This may take 10-20 seconds) ")
     print("="*50)
 
-    # --- LOAD EVERYTHING ONCE ---
     try:
         # 1. WhisperX
         whisper_objects = load_whisperx_models(device, compute_type, hf_token)
         
-        # 2. LLM (Gemma)
+        # 2. LLM
         llm_pipe = load_llm_pipeline(device)
         
         # 3. SpeechBrain Encoder
@@ -138,15 +167,13 @@ if __name__ == "__main__":
         print(f"Startup Failure: {e}")
         sys.exit(1)
 
-    print("\n[System] All models loaded. Ready for live input.\n")
+    print("\n[System] Ready. Listening...\n")
 
     while True:
         try:
-            # 1. Listen
             audio_file = recorder.record("live_input.wav")
             
             if audio_file:
-                # 2. Process with loaded models
                 run_live_pipeline(
                     audio_file, 
                     device, 

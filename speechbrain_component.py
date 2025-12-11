@@ -3,6 +3,7 @@ import torch
 import torchaudio
 import torchaudio.transforms as T
 from speechbrain.lobes.features import MFCC
+import time
 
 def extract_and_save_speaker_data(
     audio_path: str, 
@@ -15,31 +16,25 @@ def extract_and_save_speaker_data(
     and organizes them into folders by speaker name.
     """
     
-    print(f"\n[SpeechBrain Component] Loading audio from {audio_path}...")
+    # print(f"\n[SpeechBrain Component] Loading audio from {audio_path}...")
     try:
-        # Load the full audio file
-        # signal is Tensor [channels, time], fs is sample rate
         signal, fs = torchaudio.load(audio_path)
     except Exception as e:
         print(f"[SpeechBrain Component] Error loading audio: {e}")
         return
 
-    # --- FIX: Resample to 16kHz if necessary ---
-    # SpeechBrain defaults (n_fft=400) are optimized for 16kHz. 
-    # If fs is higher (e.g. 48k), win_length (25ms) becomes 1200 samples, 
-    # which is > n_fft, causing the crash.
+    # --- Resample to 16kHz if necessary ---
     target_fs = 16000
     if fs != target_fs:
-        print(f"[SpeechBrain Component] Resampling audio from {fs}Hz to {target_fs}Hz...")
         resampler = T.Resample(fs, target_fs)
         signal = resampler(signal)
         fs = target_fs
 
     # Initialize SpeechBrain MFCC computer
-    # n_mels=23 or 40 is standard. 
     compute_mfcc = MFCC(sample_rate=fs, n_mels=40)
 
-    print(f"[SpeechBrain Component] Extracting features and saving to '{output_dir}'...")
+    # Generate a unique batch timestamp
+    timestamp = int(time.time() * 1000) 
 
     for i, segment in enumerate(segments):
         # 1. Resolve Speaker Name
@@ -55,26 +50,23 @@ def extract_and_save_speaker_data(
         os.makedirs(speaker_dir, exist_ok=True)
 
         # 3. Calculate start/end samples
-        # Timestamps are in seconds, so we multiply by the NEW sample rate (16000)
         start_sec = segment["start"]
         end_sec = segment["end"]
         
         start_sample = int(start_sec * fs)
         end_sample = int(end_sec * fs)
 
-        # Ensure we don't go out of bounds
         if end_sample > signal.shape[1]:
             end_sample = signal.shape[1]
         
-        # Skip extremely short segments that might cause empty slices
-        if end_sample - start_sample < 400: # 400 samples = 25ms
+        # Skip extremely short segments (< 25ms)
+        if end_sample - start_sample < 400: 
             continue
 
         # 4. Extract Audio Slice
         audio_slice = signal[:, start_sample:end_sample]
 
         # 5. Compute MFCCs
-        # speechbrain expects [batch, time]. audio_slice is [channels, time].
         try:
             with torch.no_grad():
                 mfcc_features = compute_mfcc(audio_slice)
@@ -82,15 +74,15 @@ def extract_and_save_speaker_data(
             print(f"Warning: Could not extract MFCC for segment {i}: {e}")
             continue
 
-        # 6. Save Data
-        # Save the audio clip (.wav)
-        wav_filename = f"{safe_name}_seg{i:03d}.wav"
-        wav_path = os.path.join(speaker_dir, wav_filename)
-        torchaudio.save(wav_path, audio_slice, fs)
+        # 6. Save Data with UNIQUE Filename
+        # OLD: f"{safe_name}_seg{i:03d}.wav" (Causes overwrites)
+        # NEW: Includes timestamp
+        filename_base = f"{safe_name}_{timestamp}_{i:03d}"
+        
+        wav_path = os.path.join(speaker_dir, f"{filename_base}.wav")
+        pt_path = os.path.join(speaker_dir, f"{filename_base}_mfcc.pt")
 
-        # Save the MFCC features (.pt)
-        pt_filename = f"{safe_name}_seg{i:03d}_mfcc.pt"
-        pt_path = os.path.join(speaker_dir, pt_filename)
+        torchaudio.save(wav_path, audio_slice, fs)
         torch.save(mfcc_features, pt_path)
 
-    print(f"[SpeechBrain Component] Processing complete. Data saved in '{output_dir}/'.")
+    # print(f"[SpeechBrain Component] Saved new training data for: {list(speaker_map.values())}")
