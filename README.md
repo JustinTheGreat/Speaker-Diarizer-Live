@@ -29,6 +29,11 @@ graph LR;
   * **Smart VAD:** Energy-based and Webrtcvad triggers to ignore silence and background noise.
 
 -----
+## 🖥️ Demo Video
+
+[Youtube Link](https://youtu.be/BKfjboFLpIU)
+
+-----
 
 
 ## 🛠️ Installation
