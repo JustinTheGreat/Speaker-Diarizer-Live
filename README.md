@@ -5,6 +5,8 @@
 
 A real-time audio analysis pipeline that combines **Voice Activity Detection (VAD)**, **Speech-to-Text (WhisperX)**, **Biometric Recognition (SpeechBrain)**, and **LLM Contextual Analysis (Gemma/Transformers)** to transcribe and identify speakers in a live web interface.
 
+![Demo Image](Images/Demo.png)
+
 ```mermaid
 graph LR;
     A(Audio Intake)
